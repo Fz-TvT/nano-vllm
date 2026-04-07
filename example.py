@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("/home/cfz/nano-vllm/~/huggingface/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
@@ -12,6 +12,7 @@ def main():
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
+        "write a haiku poem",
     ]
     prompts = [
         tokenizer.apply_chat_template(
