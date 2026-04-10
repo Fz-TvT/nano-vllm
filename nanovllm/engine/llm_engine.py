@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler2 import Scheduler
+from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -67,13 +67,26 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.arrival_time = perf_counter()
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [
+            (
+                seq.seq_id,
+                {
+                    "token_ids": seq.completion_token_ids,
+                    "arrival_time": seq.arrival_time,
+                    "first_token_time": seq.first_token_time,
+                    "finish_time": seq.finish_time,
+                },
+            )
+            for seq in seqs
+            if seq.is_finished
+        ]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -106,12 +119,21 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, payload in output:
+                outputs[seq_id] = payload
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {
+                "text": self.tokenizer.decode(item["token_ids"]),
+                "token_ids": item["token_ids"],
+                "arrival_time": item["arrival_time"],
+                "first_token_time": item["first_token_time"],
+                "finish_time": item["finish_time"],
+            }
+            for item in outputs
+        ]
         if use_tqdm:
             pbar.close()
         return outputs

@@ -31,6 +31,9 @@ class Sequence:
         self.decode_steps_in_level = 0
         self.last_access_tick = 0
         self.waiting_since_tick = 0
+        self.arrival_time = None
+        self.first_token_time = None
+        self.finish_time = None
 
     def __len__(self):
         return self.num_tokens
@@ -85,6 +88,9 @@ class Sequence:
             self.decode_steps_in_level,
             self.last_access_tick,
             self.waiting_since_tick,
+            self.arrival_time,
+            self.first_token_time,
+            self.finish_time,
             self.token_ids,
         )
 
@@ -98,6 +104,9 @@ class Sequence:
             self.decode_steps_in_level,
             self.last_access_tick,
             self.waiting_since_tick,
+            self.arrival_time,
+            self.first_token_time,
+            self.finish_time,
         ) = state[:-1]
         self.token_ids = state[-1]
         self.last_token = self.token_ids[-1]

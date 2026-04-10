@@ -193,3 +193,16 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Project local artifacts
+ShareGPT_V3_unfiltered_cleaned_split.json
+
+# Local model weights/checkpoints (downloaded for benchmarking)
+~/
+huggingface/
+*.safetensors
+*.safetensors.index.json
+
+# Runtime leftovers
+*.core
+core.*
