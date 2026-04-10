@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -6,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen_moe import Qwen2ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -14,37 +15,55 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], shm_name: str):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.graph_enabled = False
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.shm_size = int(os.environ.get("NANOVLLM_SHM_SIZE", str(2**24)))
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        master_port = int(
+            os.environ.get(
+                "NANOVLLM_MASTER_PORT",
+                os.environ.get("MASTER_PORT", "2333"),
+            )
+        )
+        if master_port < 1024:
+            master_port = 2333
+        dist.init_process_group(
+            "nccl",
+            f"tcp://localhost:{master_port}",
+            world_size=self.world_size,
+            rank=rank,
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen2ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        # MoE 路由包含动态控制流，通常不适合 CUDA Graph 捕获。
+        is_moe = getattr(hf_config, "model_type", "") == "qwen2_moe"
+        if (not self.enforce_eager) and (not is_moe):
             self.capture_cudagraph()
+            self.graph_enabled = True
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=shm_name, create=True, size=self.shm_size)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=shm_name)
                 self.loop()
 
     def exit(self):
@@ -53,7 +72,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if self.graph_enabled:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -77,6 +96,12 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        capacity = len(self.shm.buf)
+        if n + 4 > capacity:
+            raise ValueError(
+                f"SharedMemory overflow: payload={n} bytes, capacity={capacity} bytes. "
+                f"Increase NANOVLLM_SHM_SIZE (current={self.shm_size})."
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -188,7 +213,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or self.enforce_eager or (not self.graph_enabled) or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)

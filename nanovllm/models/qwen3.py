@@ -190,7 +190,7 @@ class Qwen3ForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
-
+ 
     def __init__(
         self,
         config: Qwen3Config

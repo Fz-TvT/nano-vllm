@@ -85,7 +85,7 @@ class Sequence:
             self.decode_steps_in_level,
             self.last_access_tick,
             self.waiting_since_tick,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.token_ids,
         )
 
     def __setstate__(self, state):
@@ -99,7 +99,5 @@ class Sequence:
             self.last_access_tick,
             self.waiting_since_tick,
         ) = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_token = state[-1]
+        self.token_ids = state[-1]
+        self.last_token = self.token_ids[-1]

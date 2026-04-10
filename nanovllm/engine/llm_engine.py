@@ -1,4 +1,6 @@
 import atexit
+import os
+import socket
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -8,26 +10,45 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler2 import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
 
+    @staticmethod
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.shm_name = f"nanovllm_{os.getpid()}"
+        if not os.environ.get("NANOVLLM_MASTER_PORT"):
+            if os.environ.get("MASTER_PORT"):
+                os.environ["NANOVLLM_MASTER_PORT"] = os.environ["MASTER_PORT"]
+            else:
+                os.environ["NANOVLLM_MASTER_PORT"] = str(self._find_free_port())
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        try:
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event, self.shm_name))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events, self.shm_name)
+        except Exception:
+            for p in self.ps:
+                if p.is_alive():
+                    p.terminate()
+                p.join(timeout=2)
+            raise
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
@@ -37,7 +58,10 @@ class LLMEngine:
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
-            p.join()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
