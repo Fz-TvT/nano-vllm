@@ -84,22 +84,8 @@ class Qwen2MoeAttention(nn.Module):
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
-class Qwen2MoeTopKRouter():
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        k: int = 2,
-    ) -> None:
-        self.num_experts = num_experts
-        self.k = k
-        self.gate_proj = MergedColumnParallelLinear(hidden_size, num_experts, bias=False)
 
-    def forward(self, x):
-        gate_scores = self.gate_proj(x)
-        topk_scores, topk_indices = torch.topk(gate_scores, self.k, dim=-1)
-        return topk_indices
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
@@ -178,10 +164,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", False)
         
         # 获取并行参数
         self.tp_size = dist.get_world_size()
         self.tp_rank = dist.get_rank()
+        assert self.num_experts % self.tp_size == 0
         
         # 每个 Rank 负责的专家数量
         self.experts_per_rank = self.num_experts // self.tp_size
@@ -209,6 +197,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # 共享专家的门控开关
         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
 
+    def _route_local_experts(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        routed_hidden_states = torch.zeros_like(hidden_states)
+
+        for local_idx, global_idx in enumerate(range(self.start_idx, self.end_idx)):
+            token_mask = (selected_experts == global_idx).any(dim=-1)
+            if not token_mask.any():
+                continue
+
+            expert_mask = selected_experts == global_idx
+            expert_weights = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
+            expert_output = self.experts[local_idx](hidden_states[token_mask])
+            routed_hidden_states[token_mask] += expert_output * expert_weights[token_mask]
+
+        return routed_hidden_states
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # 1. 计算路由得分
         router_logits = self.gate(hidden_states)
@@ -217,27 +225,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         
         # 2. 选择全局 Top-K 专家
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        
-        # 3. 计算本 Rank 负责的专家输出
-        final_hidden_states = torch.zeros_like(hidden_states)
-        
-        for local_idx, global_idx in enumerate(range(self.start_idx, self.end_idx)):
-            # 检查哪些 token 选到了这个 global_idx 专家
-            # selected_experts 维度是 [tokens, top_k]
-            mask = (selected_experts == global_idx).any(dim=-1)
-            if mask.any():
-                # 计算选到该专家的 token 的权重和
-                # 找到对应 global_idx 在 top-k 矩阵中的位置来提取 weight
-                weights_mask = (selected_experts == global_idx)
-                expert_weights = (routing_weights * weights_mask).sum(dim=-1, keepdim=True)
-                
-                expert_output = self.experts[local_idx](hidden_states[mask])
-                final_hidden_states[mask] += expert_output * expert_weights[mask]
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-        # 4. 【通信】All-gather + Sum 汇总所有 Rank 计算出的专家增量 
-        dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM)
-        # 5. 加上 Shared Expert 结果
+        # 3. 计算本 Rank 负责的专家输出，并汇总到全局结果
+        final_hidden_states = self._route_local_experts(hidden_states, selected_experts, routing_weights)
+        if self.tp_size > 1:
+            dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM)
+
+        # 4. 加上 Shared Expert 结果
         shared_output = self.shared_expert(hidden_states)
         shared_weight = torch.sigmoid(self.shared_expert_gate(hidden_states))
         
